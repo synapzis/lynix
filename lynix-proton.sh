@@ -49,9 +49,19 @@ PROTON_ROOT="$DATA_DIR/proton"
 PREFIX_DIR="$DATA_DIR/prefix"
 CACHE_DIR="$DATA_DIR/cache"
 LOG_DIR="$DATA_DIR/logs"
+BACKUP_DIR="$DATA_DIR/backups"
 FAKE_STEAM="$DATA_DIR/steam-client"
 LOG_FILE="$LOG_DIR/launcher.log"
 DESKTOP_FILE="${XDG_DATA_HOME:-$HOME/.local/share}/applications/$APP_ID.desktop"
+
+# WebView2 ignores these features via a machine policy inside the private
+# prefix.  HideCursorWhileTyping is broken in WebView2 152-156: it can leave
+# the pointer hidden or stuck inside the app after a WebView2 window closes.
+# --disable-gpu avoids a WebView2 GPU-process startup failure under Wine that
+# makes UI.exe exit with status 5.  Keep --disable-gpu LAST: WebView2 parses
+# the policy string as a command line and treats the first token as the
+# program name, so a leading switch is ignored.
+WEBVIEW_POLICY_FEATURES="--disable-features=HideCursorWhileTyping --disable-gpu"
 
 GUI=""
 NO_GUI=0
@@ -67,6 +77,7 @@ PURGE=0
 PROTON_ARG=""
 PROTON_DL=""
 EXE_ARG=""
+RESET_WEBVIEW=0
 PASSTHRU=()
 
 usage() {
@@ -95,6 +106,8 @@ Options:
   --no-gui                   Never use zenity/kdialog; prompt in the terminal
   --debug                    Keep Proton/Wine logs and verbose output
   --reset                    Forget the saved UI.exe/Proton choices, then run
+  --reset-webview            Move all WebView2 profiles (UI.exe and Roblox)
+                             to the backup folder before launching
   --version                  Print the version and exit
 
 Environment:
@@ -105,6 +118,10 @@ Environment:
   LYNIX_PROTON               Use this Proton folder without saving it
   LYNIX_SCRIPT_URL           URL of this script; lets --install-desktop save
                              a copy when the script was run from a pipe
+  LYNIX_ENABLE_WAYLAND       Set to 1 to try Proton's native Wayland driver
+                             (WebView2 may render black on some systems)
+  LYNIX_NO_WEBVIEW_RETRY     Set to 1 to disable the automatic WebView2
+                             profile reset and one-shot retry
 
 Notes:
   * The script can be piped directly from curl.  Prompts are read from the
@@ -113,6 +130,10 @@ Notes:
   * No Steam installation is required.  Steam Proton installs are used when
     found, otherwise a private GDK-Proton/GE-Proton build is downloaded.
   * WebView2 and the Visual C++ runtime are installed into the private prefix.
+  * The launcher configures Xwayland mouse/cursor behavior and a WebView2
+    policy that fixes the cursor-hiding regression in WebView2 152-156.
+  * The app runs on Xwayland by default.  Native Wayland renders WebView2
+    content black on many systems; set LYNIX_ENABLE_WAYLAND=1 to opt in.
   * First setup can take several minutes and needs ~3 GB of free disk space.
 
 Logs:
@@ -371,7 +392,7 @@ parse_args() {
   while [ "$#" -gt 0 ]; do
     case "$1" in
       -h|--help) usage; exit 0 ;;
-      --version) printf '%s\n' "$APP_NAME 1.0.0"; exit 0 ;;
+      --version) printf '%s\n' "$APP_NAME 1.1.0"; exit 0 ;;
       --select|--change-exe) FORCE_SELECT=1 ;;
       --exe)
         EXE_ARG="$(arg_value "$1" "${2:-}")"
@@ -398,6 +419,7 @@ parse_args() {
       --no-gui) NO_GUI=1 ;;
       --debug) DEBUG=1 ;;
       --reset) RESET=1 ;;
+      --reset-webview) RESET_WEBVIEW=1 ;;
       --)
         shift
         while [ "$#" -gt 0 ]; do PASSTHRU+=("$1"); shift; done
@@ -709,11 +731,57 @@ ensure_prefix() {
   chmod 700 "$PREFIX_DIR" 2>/dev/null || true
 }
 
+configure_cursor_env() {
+  # Wine's X11 driver maps standard Windows cursors to the host Xcursor theme.
+  # KDE/GNOME do not always export these variables to Xwayland clients, so
+  # derive them from the desktop settings instead of relying on Xresources.
+  local theme="${XCURSOR_THEME:-}" size="${XCURSOR_SIZE:-}"
+
+  if [ -z "$theme" ] && have kreadconfig6; then
+    theme="$(kreadconfig6 --file kcminputrc --group Mouse --key cursorTheme 2>/dev/null || true)"
+  fi
+  if [ -z "$theme" ] && have kreadconfig5; then
+    theme="$(kreadconfig5 --file kcminputrc --group Mouse --key cursorTheme 2>/dev/null || true)"
+  fi
+  if [ -z "$theme" ] && have gsettings; then
+    theme="$(gsettings get org.gnome.desktop.interface cursor-theme 2>/dev/null | tr -d "'" || true)"
+  fi
+  if [ -z "$theme" ] && have xrdb && [ -n "${DISPLAY:-}" ]; then
+    theme="$(xrdb -query 2>/dev/null | awk '/Xcursor\.theme:/ { print $2; exit }')"
+  fi
+  if [ -n "$theme" ]; then
+    export XCURSOR_THEME="$theme"
+  fi
+
+  if [ -z "$size" ] && have kreadconfig6; then
+    size="$(kreadconfig6 --file kcminputrc --group Mouse --key cursorSize 2>/dev/null || true)"
+  fi
+  if [ -z "$size" ] && have kreadconfig5; then
+    size="$(kreadconfig5 --file kcminputrc --group Mouse --key cursorSize 2>/dev/null || true)"
+  fi
+  if [ -z "$size" ] && have gsettings; then
+    size="$(gsettings get org.gnome.desktop.interface cursor-size 2>/dev/null || true)"
+  fi
+  if [ -z "$size" ] && have xrdb && [ -n "${DISPLAY:-}" ]; then
+    size="$(xrdb -query 2>/dev/null | awk '/Xcursor\.size:/ { print $2; exit }')"
+  fi
+  case "$size" in ''|*[!0-9]*) size="" ;; esac
+  if [ -n "$size" ]; then
+    export XCURSOR_SIZE="$size"
+  fi
+}
+
 proton_env() {
   export STEAM_COMPAT_CLIENT_INSTALL_PATH="$FAKE_STEAM"
   export STEAM_COMPAT_DATA_PATH="$PREFIX_DIR"
   export PROTON_LOG=1
   export PROTON_LOG_DIR="$LOG_DIR"
+  # WebView2's embedded Chromium can render black when Proton uses its native
+  # Wayland driver.  Xwayland is the tested default; opt in only explicitly.
+  if [ "${LYNIX_ENABLE_WAYLAND:-0}" != "1" ]; then
+    unset PROTON_ENABLE_WAYLAND PROTON_USE_WAYLAND
+  fi
+  configure_cursor_env
   if [ "$DEBUG" -eq 1 ]; then
     export WINEDEBUG="${WINEDEBUG:-+timestamp,+pid,+seh}"
   else
@@ -829,21 +897,103 @@ ensure_webview2() {
   log "Installed WebView2 runtime."
 }
 
-set_webview2_policy() {
-  # Software rendering avoids several WebView2/Wine presentation bugs.
-  # The policy is local to this private prefix.
-  local reg="$PREFIX_DIR/pfx/system.reg"
-  if [ -f "$reg" ] && grep -a -q 'AdditionalBrowserArguments' "$reg" 2>/dev/null; then
-    return 0
+reg_value_matches() {
+  # reg_value_matches REGFILE SECTION NAME VALUE
+  # Checks an exact "name"="value" line in a Wine .reg file and compares the
+  # data with backslashes escaped the way Wine writes them.
+  local file="$1" section="$2" name="$3" value="$4" escaped
+  [ -f "$file" ] || return 1
+  escaped="${value//\\/\\\\}"
+  REG_SECTION="$section" REG_NAME="$name" REG_VALUE="$escaped" awk '
+    index($0, "[" ENVIRON["REG_SECTION"] "]") == 1 { inside = 1; next }
+    inside && /^\[/ { exit }
+    inside {
+      key = "\"" ENVIRON["REG_NAME"] "\"=\""
+      if (index($0, key) == 1) {
+        if ($0 == key ENVIRON["REG_VALUE"] "\"") found = 1
+        exit
+      }
+    }
+    END { exit(found ? 0 : 1) }
+  ' "$file" 2>/dev/null
+}
+
+webview2_policy_hosts() {
+  # "host executable|log file".  Specific values override the "*" default,
+  # so every entry must contain the complete argument set.
+  printf '%s\n' \
+    '*|lynx-webview.log' \
+    'UI.exe|lynx-ui-webview.log' \
+    'RobloxPlayerBeta.exe|lynx-roblox-webview.log' \
+    'RobloxPlayerLauncher.exe|lynx-roblox-launcher-webview.log' \
+    'RobloxStudioBeta.exe|lynx-roblox-studio-webview.log' \
+    'RobloxStudioLauncherBeta.exe|lynx-roblox-studio-launcher-webview.log'
+}
+
+webview2_policy_value() {
+  # Logging is opt-in: Chromium's --enable-logging opens a visible console
+  # window for msedgewebview2.exe on Wine, even with --log-file.
+  local log_name="$1" value="$WEBVIEW_POLICY_FEATURES"
+  if [ "$DEBUG" -eq 1 ]; then
+    value="$value --enable-logging --v=1 --log-file=C:\\$log_name"
   fi
-  log "Setting WebView2 policy for the private prefix."
+  printf '%s' "$value"
+}
+
+set_webview2_policy() {
+  # One policy covers both embedded browsers: UI.exe's own WebView2 and the
+  # WebView2 instances hosted by Roblox.  The cursor fix and log redirection
+  # must be present in every value because an exe-specific value replaces "*".
+  local reg="$PREFIX_DIR/pfx/system.reg"
+  local policy_key='Software\\Policies\\Microsoft\\Edge\\WebView2\\AdditionalBrowserArguments'
+  local host log_name value need_policy=0
+
+  while IFS='|' read -r host log_name; do
+    [ -n "$host" ] || continue
+    value="$(webview2_policy_value "$log_name")"
+    if ! reg_value_matches "$reg" "$policy_key" "$host" "$value"; then
+      need_policy=1
+      break
+    fi
+  done < <(webview2_policy_hosts)
+
+  [ "$need_policy" -eq 1 ] || return 0
+
+  log "Updating WebView2 policy (cursor/startup fixes) in the private prefix."
+  proton_env
+  while IFS='|' read -r host log_name; do
+    [ -n "$host" ] || continue
+    value="$(webview2_policy_value "$log_name")"
+    "$PROTON_DIR/proton" runinprefix "C:\\windows\\system32\\reg.exe" add \
+      "HKLM\\SOFTWARE\\Policies\\Microsoft\\Edge\\WebView2\\AdditionalBrowserArguments" \
+      /v "$host" /t REG_SZ /d "$value" /f </dev/null >>"$LOG_FILE" 2>&1 \
+      || log "WARNING: could not update the WebView2 policy for $host."
+  done < <(webview2_policy_hosts)
+}
+
+set_wine_input_settings() {
+  # Explicit X11 driver options:
+  #   GrabFullscreen=N   do not confine the pointer to fullscreen windows
+  #   UseSystemCursors=Y draw standard cursors with the host Xcursor theme
+  # Wine 10 already defaults to these values, but writing them keeps the
+  # behavior stable across Proton/Wine upgrades and prefix re-creation.
+  local reg="$PREFIX_DIR/pfx/user.reg"
+  local driver="HKCU\\Software\\Wine\\X11 Driver"
+  local driver_key='Software\\Wine\\X11 Driver'
+  local need_settings=0
+
+  reg_value_matches "$reg" "$driver_key" "GrabFullscreen" "N" || need_settings=1
+  reg_value_matches "$reg" "$driver_key" "UseSystemCursors" "Y" || need_settings=1
+  [ "$need_settings" -eq 1 ] || return 0
+
+  log "Configuring Wine pointer and cursor behavior in the private prefix."
   proton_env
   "$PROTON_DIR/proton" runinprefix "C:\\windows\\system32\\reg.exe" add \
-    "HKLM\\SOFTWARE\\Policies\\Microsoft\\Edge\\WebView2\\AdditionalBrowserArguments" \
-    /v "*" /t REG_SZ /d "--disable-gpu" /f </dev/null >>"$LOG_FILE" 2>&1 || true
+    "$driver" /v GrabFullscreen /t REG_SZ /d N /f </dev/null >>"$LOG_FILE" 2>&1 \
+    || log "WARNING: could not set Wine GrabFullscreen."
   "$PROTON_DIR/proton" runinprefix "C:\\windows\\system32\\reg.exe" add \
-    "HKLM\\SOFTWARE\\Policies\\Microsoft\\Edge\\WebView2\\AdditionalBrowserArguments" \
-    /v "UI.exe" /t REG_SZ /d "--disable-gpu" /f </dev/null >>"$LOG_FILE" 2>&1 || true
+    "$driver" /v UseSystemCursors /t REG_SZ /d Y /f </dev/null >>"$LOG_FILE" 2>&1 \
+    || log "WARNING: could not set Wine UseSystemCursors."
 }
 
 ensure_runtimes() {
@@ -851,6 +1001,7 @@ ensure_runtimes() {
   ensure_vcredist
   ensure_webview2
   set_webview2_policy
+  set_wine_input_settings
 }
 
 show_status() {
@@ -975,6 +1126,87 @@ clean_stale_app_state() {
   rm -f "$appdir/mcp/endpoint.json" "$appdir/port"
 }
 
+webview_profile_dirs() {
+  # List the WebView2 user-data folders.  "ui" matches UI.exe only; "all"
+  # also includes every WebView2 instance embedded in Roblox.
+  local mode="${1:-all}"
+  local local_app="$PREFIX_DIR/pfx/drive_c/users/steamuser/AppData/Local"
+  local -a ui_profiles=(
+    "$local_app"/com.savage.*/EBWebView
+  )
+  local -a roblox_profiles=(
+    "$local_app"/Roblox/UniversalApp/WebView2/EBWebView
+    "$local_app"/Roblox/Versions/*/RobloxPlayerBeta.exe.WebView2/EBWebView
+    "$local_app"/Roblox/Versions/*/RobloxPlayerLauncher.exe.WebView2/EBWebView
+    "$local_app"/Roblox/Versions/*/RobloxStudioBeta.exe.WebView2/EBWebView
+    "$local_app"/Roblox/Versions/*/RobloxStudioLauncherBeta.exe.WebView2/EBWebView
+  )
+  local dir
+
+  for dir in "${ui_profiles[@]}"; do
+    [ -d "$dir" ] || continue
+    printf '%s\n' "$dir"
+  done
+  if [ "$mode" = "ui" ]; then
+    return 0
+  fi
+  for dir in "${roblox_profiles[@]}"; do
+    [ -d "$dir" ] || continue
+    printf '%s\n' "$dir"
+  done
+}
+
+backup_webview_profile() {
+  local dir="$1" stamp="$2"
+  local base="$PREFIX_DIR/pfx/drive_c/users/steamuser/AppData/Local"
+  local rel dest n=1
+  rel="${dir#"$base"/}"
+  rel="${rel%/EBWebView}"
+  rel="${rel//\//-}"
+  rel="${rel//[^A-Za-z0-9._-]/_}"
+  dest="$BACKUP_DIR/EBWebView-${rel}-${stamp}"
+  while [ -e "$dest" ]; do
+    dest="$BACKUP_DIR/EBWebView-${rel}-${stamp}-${n}"
+    n=$((n + 1))
+  done
+  mkdir -p "$BACKUP_DIR"
+  mv -- "$dir" "$dest" || return 1
+  printf '%s' "$dest"
+}
+
+reset_webview_profiles() {
+  # Never delete a profile: move it into the backup folder so cookies,
+  # settings and the WebView2 cache remain recoverable.
+  local mode="${1:-all}" stamp dir dest count=0
+  stamp="$(date +%Y%m%d-%H%M%S)"
+  while IFS= read -r dir; do
+    [ -n "$dir" ] || continue
+    if dest="$(backup_webview_profile "$dir" "$stamp")"; then
+      log "Moved WebView2 profile to $dest"
+      printf 'Moved WebView2 profile to %s\n' "$dest"
+      count=$((count + 1))
+    else
+      log "WARNING: could not move WebView2 profile: $dir"
+      printf 'WARNING: could not move WebView2 profile: %s\n' "$dir" >&2
+    fi
+  done < <(webview_profile_dirs "$mode")
+  if [ "$count" -eq 0 ]; then
+    log "No WebView2 profiles found to reset ($mode)."
+  fi
+  return 0
+}
+
+maybe_reset_webview() {
+  [ "$RESET_WEBVIEW" -eq 1 ] || return 0
+  local pid
+  if pid="$(app_is_running)"; then
+    die "Lynx is running (pid $pid). Close it before using --reset-webview."
+  fi
+  log "Resetting all WebView2 profiles at user request."
+  reset_webview_profiles all
+  RESET_WEBVIEW=0
+}
+
 launch_app() {
   [ -f "$EXE_PATH" ] || die "UI.exe was not found:\n$EXE_PATH"
   [ -x "$PROTON_DIR/proton" ] || die "Proton was not found:\n$PROTON_DIR"
@@ -991,6 +1223,8 @@ launch_app() {
     return 0
   fi
 
+  ensure_runtimes
+  maybe_reset_webview
   clean_stale_app_state
 
   proton_env
@@ -999,24 +1233,52 @@ launch_app() {
     notify-send "$APP_NAME" "Starting Lynx..." >/dev/null 2>&1 || true
   fi
 
-  local rc=0
+  local rc=0 retried=0
   local exe_dir exe_name
   exe_dir="$(dirname -- "$EXE_PATH")"
   exe_name="$(basename -- "$EXE_PATH")"
-  set +e
-  # Proton launches through its internal steam.exe shim.  It must receive a
-  # name relative to the working directory, not an absolute Unix path, or the
-  # app may start in a broken state and exit shortly afterwards.
-  ( cd "$exe_dir" && "$PROTON_DIR/proton" run "$exe_name" "${PASSTHRU[@]}" ) </dev/null >>"$LOG_FILE" 2>&1
-  rc=$?
-  set -e
+
+  while :; do
+    set +e
+    # Proton launches through its internal steam.exe shim.  It must receive a
+    # name relative to the working directory, not an absolute Unix path, or the
+    # app may start in a broken state and exit shortly afterwards.
+    ( cd "$exe_dir" && "$PROTON_DIR/proton" run "$exe_name" "${PASSTHRU[@]}" ) </dev/null >>"$LOG_FILE" 2>&1
+    rc=$?
+    set -e
+
+    if [ "$rc" -eq 0 ]; then
+      break
+    fi
+    log "UI.exe/Proton exited with status $rc"
+
+    if [ "$retried" -eq 0 ] \
+      && { [ "$rc" -eq 5 ] || [ "$rc" -eq 247 ]; } \
+      && [ "${LYNIX_NO_WEBVIEW_RETRY:-0}" != "1" ]; then
+      retried=1
+      log "Resetting the UI.exe WebView2 profile and retrying once."
+      reset_webview_profiles ui
+      clean_stale_app_state
+      proton_env
+      sleep 2
+      continue
+    fi
+    break
+  done
 
   if [ "$rc" -ne 0 ]; then
-    local tailtext
+    local tailtext hint=""
     tailtext="$(tail -n 20 "$LOG_FILE" 2>/dev/null || true)"
-    log "UI.exe/Proton exited with status $rc"
-    gui_error "Lynx/Proton exited with status $rc.\n\nLast log lines:\n$tailtext\n\nFull log:\n$LOG_FILE"
+    case "$rc" in
+      5|247)
+        hint="\n\nWebView2 profile backups are in:\n$BACKUP_DIR\nA fresh profile did not fix this exit status. Check that the WebView2 runtime is current and see the launcher log."
+        ;;
+    esac
+    gui_error "Lynx/Proton exited with status $rc.\n\nLast log lines:\n$tailtext$hint\n\nFull log:\n$LOG_FILE"
     exit "$rc"
+  fi
+  if [ "$retried" -eq 1 ]; then
+    log "UI.exe started successfully after the WebView2 profile reset."
   fi
   log "UI.exe exited normally."
 }
@@ -1046,9 +1308,10 @@ main() {
 
   ensure_exe
   ensure_proton
-  ensure_runtimes
 
   if [ "$NO_LAUNCH" -eq 1 ]; then
+    ensure_runtimes
+    maybe_reset_webview
     local launch_hint
     if [ -n "$SCRIPT_PATH" ]; then
       launch_hint="$SCRIPT_PATH"
